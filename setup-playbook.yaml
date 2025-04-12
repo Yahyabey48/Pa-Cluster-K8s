@@ -1,0 +1,435 @@
+# SOLUTION POUR LE CONFLIT DE DÉPÔT DOCKER
+# Ajoutez ceci au début de votre playbook pour un nettoyage radical
+
+- name: Nettoyage radical des configurations Docker et apt
+  hosts: all
+  become: yes
+  tasks:
+  - name: Rechercher et supprimer tous les fichiers liés à Docker
+    shell: |
+      # Suppression radicale de toutes les configurations Docker
+      find /etc/apt/ -name "*docker*" -exec rm -f {} \;
+      find /usr/share/keyrings/ -name "*docker*" -exec rm -f {} \;
+      find /etc/apt/sources.list.d/ -name "*docker*" -exec rm -f {} \;
+      
+      # Supprimer les références de Docker dans sources.list principal
+      sed -i '/docker/d' /etc/apt/sources.list
+      
+      # Mise à jour du cache apt après nettoyage
+      apt-get clean
+      apt-get update --allow-insecure-repositories
+    args:
+      executable: /bin/bash
+    ignore_errors: yes
+    
+  - name: Installer Docker à partir de zéro avec la méthode officielle
+    shell: |
+      # Installer les prérequis
+      apt-get update
+      apt-get install -y ca-certificates curl gnupg
+      
+      # Créer le répertoire pour les nouvelles clés
+      install -m 0755 -d /etc/apt/keyrings
+      
+      # Télécharger et configurer la clé Docker officielle
+      curl -fsSL https://download.docker.com/linux/debian/gpg -o /tmp/docker.gpg
+      gpg --dearmor -o /etc/apt/keyrings/docker.gpg < /tmp/docker.gpg
+      chmod a+r /etc/apt/keyrings/docker.gpg
+      
+      # Ajouter le dépôt Docker
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
+      
+      # Mettre à jour et installer Docker
+      apt-get update
+      apt-get install -y docker-ce docker-ce-cli containerd.io
+    args:
+      executable: /bin/bash
+
+- name: Initialize all nodes for Kubernetes
+  hosts: all
+  become: yes  # Utiliser sudo pour toutes les tâches
+  tasks:
+   # Mise à jour du système
+   - name: Update apt package cache
+     apt:
+       update_cache: yes
+
+   - name: Upgrade all packages
+     apt:
+       upgrade: dist
+       
+   # Installer les outils de base
+   - name: Install basic tools
+     apt:
+       name:
+         - apt-transport-https
+         - ca-certificates
+         - curl
+         - gnupg
+         - lsb-release
+         - python3-pip
+         - net-tools
+         - ipvsadm
+         - ipset
+       state: present
+
+   # Charger le module br_netfilter
+   - name: Load br_netfilter module
+     command: modprobe br_netfilter
+
+   # Charger le module overlay
+   - name: Load overlay module
+     command: modprobe overlay
+
+   # Ajouter les modules au démarrage
+   - name: Ensure kernel modules are loaded on boot
+     copy:
+       dest: /etc/modules-load.d/kubernetes.conf
+       content: |
+         overlay
+         br_netfilter
+
+   # Configuration des paramètres sysctl pour Kubernetes
+   - name: Configure sysctl for Kubernetes
+     copy:
+       dest: /etc/sysctl.d/99-kubernetes-cri.conf
+       content: |
+         net.bridge.bridge-nf-call-iptables = 1
+         net.bridge.bridge-nf-call-ip6tables = 1
+         net.ipv4.ip_forward = 1
+         vm.swappiness = 0
+
+   # Appliquer les paramètres sysctl
+   - name: Apply sysctl parameters
+     command: sysctl --system
+
+   # Installer util-linux pour swapoff
+   - name: Install util-linux (required for swapoff)
+     apt:
+       name: util-linux
+       state: present
+
+   # Désactiver le SWAP
+   - name: Disable SWAP
+     command: swapoff -a
+
+   # Désactiver le SWAP dans /etc/fstab
+   - name: Disable SWAP in fstab
+     lineinfile:
+       path: /etc/fstab
+       regexp: '^.*swap.*$'
+       line: '#\0'
+       backrefs: yes
+
+   # Configurer NTP pour la synchronisation d'horloge
+   - name: Install NTP for time synchronization
+     apt:
+       name: ntp
+       state: present
+
+   - name: Enable and start NTP service
+     service:
+       name: ntp
+       state: started
+       enabled: yes
+
+   # Créer le répertoire keyrings s'il n'existe pas
+   - name: Create keyrings directory
+     file:
+       path: /etc/apt/keyrings
+       state: directory
+       mode: '0755'
+
+   # Télécharger la clé GPG de Kubernetes dans le bon format
+   - name: Download Kubernetes GPG key
+     shell: |
+       curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+     args:
+       creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+   # Ajouter le dépôt Kubernetes pour Debian Bookworm
+   - name: Add Kubernetes Repository
+     apt_repository:
+       repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
+       state: present
+       filename: kubernetes
+
+   # Installer kubeadm, kubelet et kubectl
+   - name: Install Kubernetes components
+     apt:
+       name: 
+         - kubelet
+         - kubeadm
+         - kubectl
+       state: present
+
+   # Marquer les packages Kubernetes pour qu'ils ne soient pas automatiquement mis à jour
+   - name: Hold kubernetes packages
+     dpkg_selections:
+       name: "{{ item }}"
+       selection: hold
+     loop:
+       - kubelet
+       - kubeadm
+       - kubectl
+
+   # Activer et démarrer le service kubelet
+   - name: Start and enable kubelet service
+     service:
+       name: kubelet
+       enabled: yes
+       state: started
+
+- name: Initialize Kubernetes cluster on master
+  hosts: master
+  become: yes
+  tasks:
+   # Initialiser le cluster Kubernetes
+   - name: Initialize Kubernetes cluster
+     shell: |
+       kubeadm init --pod-network-cidr=10.244.0.0/16 --apiserver-advertise-address=192.168.1.166
+     args:
+       creates: /etc/kubernetes/admin.conf
+     register: kubeadm_init
+
+   # Afficher les informations d'initialisation
+   - name: Display kubeadm init output
+     debug:
+       var: kubeadm_init.stdout_lines
+     when: kubeadm_init.changed
+
+   # Configurer kubectl pour l'utilisateur ansible
+   - name: Create .kube directory for ansible user
+     file:
+       path: /home/ansible/.kube
+       state: directory
+       owner: ansible
+       group: ansible
+
+   - name: Copy kube config for ansible user
+     copy:
+       src: /etc/kubernetes/admin.conf
+       dest: /home/ansible/.kube/config
+       remote_src: yes
+       owner: ansible
+       group: ansible
+     
+   # Configurer kubectl pour l'utilisateur root
+   - name: Create .kube directory for root user
+     file:
+       path: /root/.kube
+       state: directory
+       owner: root
+       group: root
+
+   - name: Copy kube config for root user
+     copy:
+       src: /etc/kubernetes/admin.conf
+       dest: /root/.kube/config
+       remote_src: yes
+       owner: root
+       group: root
+
+   # Configurer kubectl pour utilisateur master sur le nœud master
+   - name: Create .kube directory for master user
+     file:
+       path: /home/master/.kube
+       state: directory
+       owner: master
+       group: master
+       mode: '0755'
+
+   - name: Copy kube config for master user
+     copy:
+       src: /etc/kubernetes/admin.conf
+       dest: /home/master/.kube/config
+       remote_src: yes
+       owner: master
+       group: master
+       mode: '0600'
+     
+   - name: Add KUBECONFIG to master user's .bashrc
+     lineinfile:
+       path: /home/master/.bashrc
+       line: 'export KUBECONFIG=/home/master/.kube/config'
+       state: present
+
+   # Installer Helm
+   - name: Install Helm
+     shell: |
+       curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+     args:
+       creates: /usr/local/bin/helm
+
+   # Vérifier si Cilium est déjà installé
+   - name: Check if Cilium is already installed
+     become_user: ansible
+     shell: helm list -n kube-system | grep cilium
+     register: cilium_installed
+     ignore_errors: yes
+     environment:
+       KUBECONFIG: /home/ansible/.kube/config
+     changed_when: false
+
+   # Installer Cilium via Helm s'il n'est pas déjà installé
+   - name: Install Cilium via Helm
+     become_user: ansible
+     shell: |
+       helm install cilium cilium/cilium --version 1.17.2 \
+         --namespace kube-system \
+         --set ipam.mode=kubernetes && \
+       touch /home/ansible/.cilium-installed
+     args:
+       creates: /home/ansible/.cilium-installed
+     environment:
+       KUBECONFIG: /home/ansible/.kube/config
+     when: cilium_installed.rc != 0
+
+   # Ajouter le dépôt Helm de Cilium
+   - name: Add Cilium Helm repository
+     become_user: ansible
+     shell: |
+       helm repo add cilium https://helm.cilium.io/
+       helm repo update
+     environment:
+       KUBECONFIG: /home/ansible/.kube/config
+
+   # Installer Cilium via Helm
+   - name: Install or upgrade Cilium via Helm
+     become_user: ansible
+     shell: |
+       helm upgrade --install cilium cilium/cilium --version 1.17.2 \
+         --namespace kube-system \
+         --set ipam.mode=kubernetes
+     args:
+       creates: /home/ansible/.cilium-installed
+     environment:
+       KUBECONFIG: /home/ansible/.kube/config
+
+   # Vérifier l'état de Cilium
+   - name: Check Cilium status
+     become_user: ansible
+     shell: |
+       kubectl -n kube-system get pods -l k8s-app=cilium
+     register: cilium_status
+     environment:
+       KUBECONFIG: /home/ansible/.kube/config
+
+   - name: Display Cilium status
+     debug:
+       var: cilium_status.stdout_lines
+
+   # Générer la commande de join pour les workers (toujours)
+   - name: Generate join command for worker nodes
+     shell: kubeadm token create --print-join-command
+     register: join_command
+
+   # Installer K9s (intégré dans le même play)
+   - name: Check if K9s is already installed
+     command: which k9s
+     register: k9s_check
+     ignore_errors: yes
+     changed_when: false
+
+   - name: Download and install K9s
+     shell: |
+       # Télécharger la dernière version de K9s
+       curl -sL https://github.com/derailed/k9s/releases/latest/download/k9s_Linux_amd64.tar.gz -o /tmp/k9s.tar.gz
+       
+       # Extraire le binaire
+       mkdir -p /tmp/k9s
+       tar -xzf /tmp/k9s.tar.gz -C /tmp/k9s
+       
+       # Installer K9s dans /usr/local/bin
+       cp /tmp/k9s/k9s /usr/local/bin/
+       chmod +x /usr/local/bin/k9s
+       
+       # Nettoyer
+       rm -rf /tmp/k9s /tmp/k9s.tar.gz
+     args:
+       executable: /bin/bash
+     when: k9s_check.rc != 0
+     
+   - name: Verify K9s installation
+     shell: k9s version
+     register: k9s_version
+     changed_when: false
+
+   - name: Display K9s version
+     debug:
+       var: k9s_version.stdout_lines
+
+- name: Join worker nodes to the cluster
+  hosts: workers
+  become: yes
+  tasks:
+   # Étape 1: Récupérer le fichier kubeconfig du master vers le contrôleur Ansible
+   - name: Fetch kubeconfig from master
+     fetch:
+       src: /etc/kubernetes/admin.conf
+       dest: /tmp/kube-config-{{ inventory_hostname }}
+       flat: yes
+     delegate_to: "{{ groups['master'][0] }}"
+     become: yes
+     
+   # Étape 2: Copier le fichier kubeconfig vers /root/.kube/config sur les workers
+   - name: Copy kubeconfig to root user directory
+     copy:
+       src: /tmp/kube-config-{{ inventory_hostname }}
+       dest: /root/.kube/config
+       owner: root
+       group: root
+       mode: '0600'
+     
+   # Étape 3: Copier le fichier kubeconfig pour l'utilisateur ansible
+   - name: Copy kube config for ansible user
+     copy:
+       src: /root/.kube/config
+       dest: /home/ansible/.kube/config
+       remote_src: yes
+       owner: ansible
+       group: ansible
+       mode: '0600'
+
+- name: Verify Kubernetes cluster
+  hosts: master
+  become: yes
+  tasks:
+   # Attendre que les nœuds soient prêts
+   - name: Wait for nodes to be ready
+     become_user: ansible
+     shell: kubectl get nodes
+     register: nodes_status
+     until: nodes_status.stdout.find("NotReady") == -1
+     retries: 30
+     delay: 10
+     environment:
+       KUBECONFIG: /home/ansible/.kube/config
+     changed_when: false
+     ignore_errors: yes
+
+   # Afficher l'état final des nœuds
+   - name: Check cluster nodes
+     become_user: ansible
+     shell: kubectl get nodes
+     register: nodes_output
+     environment:
+       KUBECONFIG: /home/ansible/.kube/config
+     changed_when: false
+
+   - name: Display nodes status
+     debug:
+       var: nodes_output.stdout_lines
+
+   # Vérifier les pods système
+   - name: Check system pods
+     become_user: ansible
+     shell: kubectl get pods -A
+     register: pods_output
+     environment:
+       KUBECONFIG: /home/ansible/.kube/config
+     changed_when: false
+
+   - name: Display pods status
+     debug:
+       var: pods_output.stdout_lines
